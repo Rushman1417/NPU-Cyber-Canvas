@@ -1,29 +1,56 @@
 import cv2
 import numpy as np
-import onnxruntime as ort
 import time
-from camera_loop import WebcamVideoStream, preprocess # Reuse your threaded webcam class
+from camera_loop import WebcamVideoStream, preprocess
 
-def apply_distortion(frame, pt1, pt2):
+def apply_rectangular_distortion(frame, pt1, pt2):
+    """Creates a rectangular horizontal stretching distortion zone between hands."""
     h, w = frame.shape[:2]
-    x_min = max(0, min(pt1[0], pt2[0]) - 50)
-    y_min = max(0, min(pt1[1], pt2[1]) - 50)
-    x_max = min(w, max(pt1[0], pt2[0]) + 50)
-    y_max = min(h, max(pt1[1], pt2[1]) + 50)
     
-    if x_max - x_min > 10 and y_max - y_min > 10:
-        roi = frame[y_min:y_max, x_min:x_max]
-        distorted_roi = cv2.bitwise_not(roi)
-        distorted_roi = cv2.cvtColor(distorted_roi, cv2.COLOR_BGR2XYZ)
-        distorted_roi = cv2.cvtColor(distorted_roi, cv2.COLOR_XYZ2BGR)
-        frame[y_min:y_max, x_min:x_max] = cv2.addWeighted(roi, 0.4, distorted_roi, 0.6, 0)
-        cv2.line(frame, pt1, pt2, (255, 0, 255), 3, cv2.LINE_AA)
+    # Identify the exact horizontal bounds (left and right columns)
+    x_min = max(0, min(pt1[0], pt2[0]))
+    x_max = min(w, max(pt1[0], pt2[0]))
+    
+    # We want the effect to span a distinct vertical zone around your hands (e.g., center 70% of screen)
+    y_min = max(0, min(pt1[1], pt2[1]) - 100)
+    y_max = min(h, max(pt1[1], pt2[1]) + 100)
+    
+    # Ensure the box is wide enough to warp
+    zone_width = x_max - x_min
+    zone_height = y_max - y_min
+    if zone_width < 20 or zone_height < 20: 
+        return frame
+
+    # 1. Extract the clean slice from the frame
+    roi = frame[y_min:y_max, x_min:x_max]
+    
+    # 2. Generate an intentional horizontal sine-wave stretching map
+    # This stretches the pixels horizontally inside the rectangular boundary columns
+    map_x, map_y = np.meshgrid(np.arange(zone_width), np.arange(zone_height))
+    map_x = map_x.astype(np.float32)
+    map_y = map_y.astype(np.float32)
+
+    # Calculate horizontal displacement relative to the width of the box
+    # A sine wave across the X-axis stretches the center of the box while keeping edges locked
+    displacement = 25.0 * np.sin((map_x / zone_width) * np.pi)
+    map_x += displacement
+
+    # 3. Remap the pixels smoothly within the rectangle box bounds
+    distorted_roi = cv2.remap(roi, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    
+    # Overwrite the area inside the frame
+    frame[y_min:y_max, x_min:x_max] = distorted_roi
+    
+    # Optional: Draw a subtle, thin neon border on the left and right edges ONLY (no solid connecting lines)
+    cv2.line(frame, (x_min, y_min), (x_min, y_max), (0, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(frame, (x_max, y_min), (x_max, y_max), (0, 255, 255), 1, cv2.LINE_AA)
+
     return frame
 
 def run_distortion(session, input_name):
     vvs = WebcamVideoStream(src=0).start()
     time.sleep(1.0)
-    print("Spatial Distortion Engine running... Press 'q' to go back.")
+    print("Rectangular Distortion Layer Running...")
 
     while True:
         frame = vvs.read()
@@ -39,18 +66,17 @@ def run_distortion(session, input_name):
             kpts = preds[best_idx, 5:]
             scale_x, scale_y = orig_w / 640.0, orig_h / 640.0
             
+            # Left Wrist = index 9, Right Wrist = index 10
             lw_x, lw_y, lw_conf = kpts[9*3], kpts[9*3+1], kpts[9*3+2]
             rw_x, rw_y, rw_conf = kpts[10*3], kpts[10*3+1], kpts[10*3+2]
 
             if lw_conf > 0.4 and rw_conf > 0.4:
                 pt_left = (int(lw_x * scale_x), int(lw_y * scale_y))
                 pt_right = (int(rw_x * scale_x), int(rw_y * scale_y))
-                display_frame = apply_distortion(display_frame, pt_left, pt_right)
-                cv2.circle(display_frame, pt_left, 10, (255, 0, 255), -1)
-                cv2.circle(display_frame, pt_right, 10, (255, 0, 255), -1)
+                display_frame = apply_rectangular_distortion(display_frame, pt_left, pt_right)
 
-        cv2.putText(display_frame, "NPU Spatial Distortion Mode", (10, 30), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(display_frame, "NPU Rectangular Warp Mode", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.imshow('Cyber Canvas Workspace', display_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
